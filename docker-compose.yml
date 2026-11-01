@@ -1,0 +1,381 @@
+# =============================================================================
+# HydraGateway – docker-compose.yml
+# =============================================================================
+#
+# Starts the complete HydraGateway stack with a single command:
+#   docker compose up --build
+#
+# Container layout:
+#
+#  ┌──────────────────────────────────────────────────────────────────────┐
+#  │                    Docker Network: hydra-net                         │
+#  │                                                                      │
+#  │  [Browser] → dashboard      :5173 (Nginx serving React SPA)         │
+#  │  [Browser] → load-balancer  :8080 → gateway   :3000                 │
+#  │                                   → gateway-2 :3001                 │
+#  │              gateway-1/2 → auth-service    :4001                    │
+#  │                          → product-service :4002                    │
+#  │                          → payment-service :4003                    │
+#  │                          → order-service   :4004                    │
+#  │                                                                      │
+#  │  redis :6379  ← used by gateway, auth, product, payment             │
+#  │                                                                      │
+#  │  MongoDB Atlas (external, cloud) ← accessed via MONGO_URI env var   │
+#  └──────────────────────────────────────────────────────────────────────┘
+#
+# All services load environment variables from .env.docker
+# (localhost → Docker service names, e.g. REDIS_HOST=redis)
+#
+# MongoDB is NOT run inside Docker. It is hosted on MongoDB Atlas.
+# Set MONGO_URI in your shell environment or in a .env.docker override
+# before running `docker compose up --build`.
+# =============================================================================
+
+version: "3.9"
+
+# ── Custom Bridge Network ─────────────────────────────────────────────────────
+networks:
+  hydra-net:
+    driver: bridge
+    name: hydra-net
+
+# ── Named Volumes (data persistence) ─────────────────────────────────────────
+volumes:
+  redis-data:
+    name: hydra-redis-data
+  kafka-kraft-data:
+    name: hydra-kafka-data
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Infrastructure: Redis
+  # ──────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: hydra-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"           # exposed so you can use redis-cli locally
+    volumes:
+      - redis-data:/data
+    networks:
+      - hydra-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    command: redis-server --save 60 1 --loglevel warning
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Infrastructure: Kafka (KRaft mode – no ZooKeeper)
+  # ──────────────────────────────────────────────────────────────────────────
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: hydra-kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes:
+      - kafka-kraft-data:/var/lib/kafka/data
+    networks:
+      - hydra-net
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Auth Service
+  # ──────────────────────────────────────────────────────────────────────────
+  auth-service:
+    build:
+      context: .               # build context = project root (for shared/)
+      dockerfile: packages/auth-service/Dockerfile
+    image: hydra/auth-service:latest
+    container_name: hydra-auth
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      AUTH_PORT: "4001"
+      MONGO_URI: ${MONGO_URI:-mongodb+srv://mokshasheth29_db_user:A9fXba64h3rKLOAu@cluster0.vydfppu.mongodb.net/hydragateway?retryWrites=true&w=majority&appName=Cluster0}
+    ports:
+      - "4001:4001"
+    networks:
+      - hydra-net
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Product Service
+  # ──────────────────────────────────────────────────────────────────────────
+  product-service:
+    build:
+      context: .
+      dockerfile: packages/product-service/Dockerfile
+    image: hydra/product-service:latest
+    container_name: hydra-product
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      PRODUCT_PORT: "4002"
+      MONGO_URI: ${MONGO_URI:-mongodb+srv://mokshasheth29_db_user:A9fXba64h3rKLOAu@cluster0.vydfppu.mongodb.net/hydragateway?retryWrites=true&w=majority&appName=Cluster0}
+    ports:
+      - "4002:4002"
+    networks:
+      - hydra-net
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Payment Service
+  # ──────────────────────────────────────────────────────────────────────────
+  payment-service:
+    build:
+      context: .
+      dockerfile: packages/payment-service/Dockerfile
+    image: hydra/payment-service:latest
+    container_name: hydra-payment
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      PAYMENT_PORT: "4003"
+      MONGO_URI: ${MONGO_URI:-mongodb+srv://mokshasheth29_db_user:A9fXba64h3rKLOAu@cluster0.vydfppu.mongodb.net/hydragateway?retryWrites=true&w=majority&appName=Cluster0}
+    ports:
+      - "4003:4003"
+    networks:
+      - hydra-net
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4003/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Order Service
+  # ──────────────────────────────────────────────────────────────────────────
+  order-service:
+    build:
+      context: .
+      dockerfile: packages/order-service/Dockerfile
+    image: hydra/order-service:latest
+    container_name: hydra-order
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      ORDER_PORT: "4004"
+      MONGO_URI: ${MONGO_URI:-mongodb+srv://mokshasheth29_db_user:A9fXba64h3rKLOAu@cluster0.vydfppu.mongodb.net/hydragateway?retryWrites=true&w=majority&appName=Cluster0}
+    ports:
+      - "4004:4004"
+    networks:
+      - hydra-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4004/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # API Gateway – Instance 1
+  # ──────────────────────────────────────────────────────────────────────────
+  gateway:
+    build:
+      context: .
+      dockerfile: packages/gateway/Dockerfile
+    image: hydra/gateway:latest
+    container_name: hydra-gateway-1
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      GATEWAY_PORT: "3000"
+      GATEWAY_INSTANCE_ID: "gateway-1"
+    ports:
+      - "3000:3000"
+    networks:
+      - hydra-net
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      product-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # API Gateway – Instance 2
+  # (Same image, different GATEWAY_PORT + GATEWAY_INSTANCE_ID)
+  # ──────────────────────────────────────────────────────────────────────────
+  gateway-2:
+    image: hydra/gateway:latest   # reuse the already-built image
+    container_name: hydra-gateway-2
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      GATEWAY_PORT: "3001"
+      GATEWAY_INSTANCE_ID: "gateway-2"
+    ports:
+      - "3001:3001"
+    networks:
+      - hydra-net
+    depends_on:
+      gateway:               # gateway image must be built first
+        condition: service_started
+      auth-service:
+        condition: service_healthy
+      product-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Load Balancer
+  # ──────────────────────────────────────────────────────────────────────────
+  load-balancer:
+    build:
+      context: .
+      dockerfile: packages/load-balancer/Dockerfile
+    image: hydra/load-balancer:latest
+    container_name: hydra-lb
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      LB_PORT: "8080"
+    ports:
+      - "8080:8080"
+    networks:
+      - hydra-net
+    depends_on:
+      gateway:
+        condition: service_healthy
+      gateway-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/lb-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Dashboard (React SPA served by Nginx)
+  # ──────────────────────────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: packages/dashboard/Dockerfile
+    image: hydra/dashboard:latest
+    container_name: hydra-dashboard
+    restart: unless-stopped
+    ports:
+      - "5173:80"             # visit http://localhost:5173 in your browser
+    networks:
+      - hydra-net
+    depends_on:
+      load-balancer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/nginx-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Analytics Kafka Consumer
+  # ──────────────────────────────────────────────────────────────────────────
+  analytics-consumer:
+    build:
+      context: .
+      dockerfile: packages/analytics-consumer/Dockerfile
+    image: hydra/analytics-consumer:latest
+    container_name: hydra-analytics-consumer
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    networks:
+      - hydra-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
